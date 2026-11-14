@@ -243,9 +243,20 @@ TSM_PRICE_SOURCES = {
 	["tsm-price-source-1"] = "DBMinBuyout",
 	["tsm-price-source-2"] = "DBHistorical",
 	["tsm-price-source-3"] = "DBRegionMarketAvg",
-	["tsm-price-source-4"] = "DBRegionMinBuyoutAvg",
+	["tsm-price-source-4"] = "DBRecent", -- was DBRegionMinBuyoutAvg, which TSM no longer has
 	["tsm-price-source-5"] = "DBRegionHistorical",
+	["tsm-price-source-6"] = "DBRegionSaleAvg",
 }
+TSM_PRICE_SOURCE_COUNT = 7
+
+-- where AH prices come from (FLogGlobalVars.priceAddon)
+FARMLOG_PRICE_ADDON_AUTO = 0         -- TSM, then Auctionator, then FarmLog's own AH scan
+FARMLOG_PRICE_ADDON_TSM = 1
+FARMLOG_PRICE_ADDON_AUCTIONATOR = 2
+FARMLOG_PRICE_ADDON_SCAN = 3
+FARMLOG_PRICE_ADDON_COUNT = 4
+
+local PRICE_REFRESH_SECONDS = 300
 
 FLogGlobalVars = {
 	debug = false,
@@ -253,6 +264,7 @@ FLogGlobalVars = {
 	ahScan = {},
 	ahMinQuality = 3,
 	tsmPriceSource = 0,
+	priceAddon = 0,
 	ignoredItems = {},
 	trackPartyLoot = false,
 	track = {
@@ -690,6 +702,8 @@ function FarmLog:Migrate()
 	if not FLogGlobalVars.ahScan then FLogGlobalVars.ahScan = {} end
 	if not FLogGlobalVars.ahMinQuality then FLogGlobalVars.ahMinQuality = 1 end 
 	if not FLogGlobalVars.tsmPriceSource then FLogGlobalVars.tsmPriceSource = 0 end
+	if not TSM_PRICE_SOURCES["tsm-price-source-"..FLogGlobalVars.tsmPriceSource] then FLogGlobalVars.tsmPriceSource = 0 end
+	if not FLogGlobalVars.priceAddon then FLogGlobalVars.priceAddon = FARMLOG_PRICE_ADDON_AUTO end
 
 	if FLogVars.ver < 1.1102 then 
 		-- make sure each killed mob has a drop table, even an empty one
@@ -2451,37 +2465,118 @@ function FarmLog:ShowBlackLotusTimers()
 end 
 
 -- Loot helper
+-- Price addons ----------------------------------------------------------------
+-- (inside a do-block to keep the file's local variable count down)
+do
+
+-- when the chosen TSM source has no data for an item, try these (in order)
+local TSM_FALLBACK_SOURCES = {"DBMarket", "DBRecent", "DBMinBuyout", "DBRegionMarketAvg", "DBRegionHistorical"}
+
+function FarmLog:IsTSMLoaded()
+	return TSM_API ~= nil and TSM_API.GetCustomPriceValue ~= nil
+end
+
+function FarmLog:IsAuctionatorLoaded()
+	return Atr_GetAuctionBuyout ~= nil
+		or (Auctionator ~= nil and Auctionator.API ~= nil and Auctionator.API.v1 ~= nil and Auctionator.API.v1.GetAuctionPriceByItemLink ~= nil)
+end
+
+-- FarmLog stores links with the player level replaced by "_", give addons a regular link
+local function CleanLinkForAddons(link)
+	return (link:gsub(":_:", "::", 1))
+end
+
+local function TSMItemString(link)
+	if TSM_API.ToItemString then
+		local ok, itemString = pcall(TSM_API.ToItemString, CleanLinkForAddons(link))
+		if ok and type(itemString) == "string" and itemString:find("^[ip]:%d+") then return itemString end
+	end
+	local itemId = extractItemID(link)
+	if itemId then return "i:"..itemId end
+end
+
+-- value of a TSM price source for an item, nil if TSM has no (positive) value
+local function TSMValue(source, itemString)
+	local ok, value = pcall(TSM_API.GetCustomPriceValue, source, itemString)
+	if ok and type(value) == "number" and value > 0 then return value end
+end
+
+local function GetTSMPrice(link)
+	local itemString = TSMItemString(link)
+	if not itemString then return nil end
+	local chosen = TSM_PRICE_SOURCES["tsm-price-source-"..(FLogGlobalVars.tsmPriceSource or 0)] or "DBMarket"
+	local value, usedSource = TSMValue(chosen, itemString), chosen
+	if not value then
+		-- e.g. no realm data yet on a fresh WoW Forever realm
+		for _, source in ipairs(TSM_FALLBACK_SOURCES) do
+			if source ~= chosen then
+				value = TSMValue(source, itemString)
+				if value then usedSource = source break end
+			end
+		end
+	end
+	return value, TSMValue("DBRegionSoldPerDay", itemString), usedSource
+end
+
+local function GetAuctionatorPrice(link)
+	link = CleanLinkForAddons(link)
+	if Auctionator and Auctionator.API and Auctionator.API.v1 and Auctionator.API.v1.GetAuctionPriceByItemLink then
+		local ok, value = pcall(Auctionator.API.v1.GetAuctionPriceByItemLink, "FarmLog", link)
+		if ok and type(value) == "number" and value > 0 then return value end
+	end
+	if Atr_GetAuctionBuyout then
+		local ok, value = pcall(Atr_GetAuctionBuyout, link)
+		if ok and type(value) == "number" and value > 0 then return value end
+	end
+end
+
+-- AH price of an item from the configured addon: value, soldPerDay (TSM only), source description
+local function GetAddonPrice(normLink)
+	local mode = FLogGlobalVars.priceAddon or FARMLOG_PRICE_ADDON_AUTO
+	local auto = mode == FARMLOG_PRICE_ADDON_AUTO
+	if (auto or mode == FARMLOG_PRICE_ADDON_TSM) and FarmLog:IsTSMLoaded() then
+		local value, soldPerDay, source = GetTSMPrice(normLink)
+		if value or not auto then return value, soldPerDay, "TSM "..tostring(source) end
+	end
+	if (auto or mode == FARMLOG_PRICE_ADDON_AUCTIONATOR) and FarmLog:IsAuctionatorLoaded() then
+		local value = GetAuctionatorPrice(normLink)
+		if value or not auto then return value, nil, "Auctionator" end
+	end
+	return GetAHScanPrice(normLink), nil, "FarmLog AH scan"
+end
+
+-- Loot helper
+-- returns value, value type, and a description of where the price came from
 function FarmLog:GetItemValue(itemLink)
 	local _, _, quality, _, _, _, _, _, _, _, vendorPrice = GetItemInfo(itemLink)
 	local normLink = normalizeLink(itemLink)
 	local ahValue = FarmLog:GetManualPrice(normLink)
-	local soldPerDayTSM = nil
+	local soldPerDay, priceSource = nil, nil
 	if ahValue then
-		return ahValue, VALUE_TYPE_MANUAL
-	elseif not quality or quality >= FLogGlobalVars.ahMinQuality then 
-		-- debug("GetItemValue   "..itemLink.."   quality "..quality)
-		local GetTSMPrice = TSM_API and function(link) 
-			local TSM_ItemString = TSM_API.ToItemString(normLink)
-			soldPerDayTSM = TSM_API.GetCustomPriceValue("DBRegionSoldPerDay", TSM_ItemString)
-			return TSM_API.GetCustomPriceValue(TSM_PRICE_SOURCES["tsm-price-source-"..FLogGlobalVars.tsmPriceSource], TSM_ItemString)
-		end
-		local GetAuctionatorPrice = Auctionator and function(link)
-			return Auctionator.API.v1.GetAuctionPriceByItemLink("FarmLog", link)
-		end
-		local PriceCheck = Atr_GetAuctionBuyout or GetAuctionatorPrice or GetTSMPrice or GetAHScanPrice
-		ahValue = PriceCheck(normLink)
+		return ahValue, VALUE_TYPE_MANUAL, "manual (/fl set)"
+	elseif not quality or quality >= FLogGlobalVars.ahMinQuality then
+		ahValue, soldPerDay, priceSource = GetAddonPrice(normLink)
 	end
 
 	-- check if AH price (-15%) > vendor price + 1s
 	-- also, if the AH price came from TSM, check the 'avg daily sold' value. If it's lower than 1, use the vendor price.
-	if isPositive(ahValue) 
-		and (not isPositive(vendorPrice) or ahValue * 0.85 > vendorPrice + 100) 
-		and (not FLogGlobalVars.minQuantitySold or TSM_API == nil or (isPositive(soldPerDayTSM) and soldPerDayTSM >= 1)) then
-		return ahValue, VALUE_TYPE_SCAN
-	elseif isPositive(vendorPrice) then 
-		return vendorPrice, VALUE_TYPE_VENDOR
+	local fromTSM = priceSource and priceSource:find("^TSM") ~= nil
+	if isPositive(ahValue)
+		and (not isPositive(vendorPrice) or ahValue * 0.85 > vendorPrice + 100)
+		and (not FLogGlobalVars.minQuantitySold or not fromTSM or (isPositive(soldPerDay) and soldPerDay >= 1)) then
+		return ahValue, VALUE_TYPE_SCAN, priceSource
+	elseif isPositive(vendorPrice) then
+		return vendorPrice, VALUE_TYPE_VENDOR, "vendor"
 	end
-	return 0, VALUE_TYPE_NOVALUE
+	return 0, VALUE_TYPE_NOVALUE, "none"
+end
+
+end -- price addons
+
+-- re-price all items of the current farm, so totals follow updated TSM / Auctionator data
+function FarmLog:RefreshPrices()
+	FarmLog_MainWindow:RecalcTotals()
+	FarmLog_MainWindow:Refresh()
 end
 
 -- Manual add item to session
@@ -2711,7 +2806,19 @@ function FarmLog:OnAddonLoaded()
 		end
 	end)
 
-	FarmLog:Migrate()	
+	FarmLog:Migrate()
+
+	-- TSM / Auctionator load their price data after login: re-price once they're ready, then periodically
+	if C_Timer then
+		C_Timer.After(10, function()
+			if FarmLog:IsTSMLoaded() or FarmLog:IsAuctionatorLoaded() then FarmLog:RefreshPrices() end
+		end)
+		if C_Timer.NewTicker then
+			C_Timer.NewTicker(PRICE_REFRESH_SECONDS, function()
+				if FarmLog:IsTSMLoaded() or FarmLog:IsAuctionatorLoaded() then FarmLog:RefreshPrices() end
+			end)
+		end
+	end
 
 	if not FLogGlobalVars.ahScan[REALM] then FLogGlobalVars.ahScan[REALM] = {} end 
 	if not FLogGlobalVars.ahPrice[REALM] then FLogGlobalVars.ahPrice[REALM] = {} end 
@@ -3949,6 +4056,7 @@ SlashCmdList.FARMLOG = function(msg)
 			out(" |cff00ff00/fl time <seconds>|r adjust current session time (can be positive or negative)")
 			out(" |cff00ff00/fl bl|r show black lotus log")
 			out(" |cff00ff00/fl ah|r scan AH for current prices, must have AH window open")
+			out(" |cff00ff00/fl price <item_link>|r show an item's value and where it came from (TSM, Auctionator, scan, vendor)")
 		elseif "SET" == cmd then
 			local startIndex, _ = string.find(arg1, "%|c");
 			local _, endIndex = string.find(arg1, "%]%|h%|r");
@@ -4053,9 +4161,27 @@ SlashCmdList.FARMLOG = function(msg)
 			else 
 				out("Auto resume |cff44ff44"..L["enabled"])
 			end 
-		elseif "AH" == cmd then 
+		elseif "AH" == cmd then
 			FarmLog:ScanAuctionHouse()
-		elseif "HUD" == cmd then 
+		elseif "PRICE" == cmd or "P" == cmd then
+			-- show the value FarmLog uses for an item, and where it came from
+			local startIndex = arg1 and string.find(arg1, "%|c")
+			local _, endIndex = string.find(arg1 or "", "%]%|h%|r")
+			if not startIndex or not endIndex then
+				local addons = {}
+				if FarmLog:IsTSMLoaded() then tinsert(addons, "TradeSkillMaster") end
+				if FarmLog:IsAuctionatorLoaded() then tinsert(addons, "Auctionator") end
+				out("Usage: |cff00ff00/fl price [ITEM_LINK]|r  -  price addons found: "..(#addons > 0 and table.concat(addons, ", ") or "none"))
+			else
+				local itemLink = normalizeLink(string.sub(arg1, startIndex, endIndex))
+				local value, priceType, source = FarmLog:GetItemValue(itemLink)
+				out(itemLink.." = "..GetShortCoinTextureString(value).." |cff999999("..tostring(source)..")")
+				local _, _, quality = GetItemInfo(itemLink)
+				if quality and quality < FLogGlobalVars.ahMinQuality then
+					out("|cffaaaaaaBelow the AH Min Quality option, so only the vendor price is used. Lower it in |cff00ff00/fl|cffaaaaaa options to use auction prices.")
+				end
+			end
+		elseif "HUD" == cmd then
 			if FarmLog_HUD:IsShown() then 
 				FarmLog_HUD:Hide()
 				FLogVars.hud.show = false

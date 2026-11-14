@@ -5,7 +5,7 @@
 ## Version: v1.26-forever
 ## SavedVariables: FLogGlobalVars
 ## SavedVariablesPerCharacter: FLogVars
-## OptionalDeps: Ace3, LibSharedMedia-3.0
+## OptionalDeps: Ace3, LibSharedMedia-3.0, TradeSkillMaster, Auctionator
 #@no-lib-strip@
 Libs\libs.xml
 #@end-no-lib-strip@

@@ -165,19 +165,14 @@ mfpanel.PricesCategoryTitle:SetFont(font, 16)
 mfpanel.PricesCategoryTitle:SetText(L["Prices"])
 mfpanel.PricesCategoryTitle:SetPoint("TOPLEFT", mfpanel.ShowBlackLotusTimer, "BOTTOMLEFT", 0, -20)
 
-mfpanel.AHMinQuality = mfpanel:CreateFontString(nil, 'ARTWORK', 'GameFontNormal')
-mfpanel.AHMinQuality:SetPoint("TOPLEFT", mfpanel.PricesCategoryTitle, "BOTTOMLEFT", 0, -12)
-mfpanel.AHMinQuality:SetWidth(170)
-mfpanel.AHMinQuality:SetJustifyH("LEFT")
-mfpanel.AHMinQuality:SetText(L["AH Min Quality"])
-
 -- Dropdown that works on modern clients (WoW Forever / retail menu system)
 -- and falls back to the legacy UIDropDownMenu on older clients.
 -- getText(i) returns the label of option i (first..last), getValue/setValue read/write the selection.
-local function CreateChoiceDropdown(name, parent, first, last, getText, getValue, setValue)
+local function CreateChoiceDropdown(name, parent, first, last, getText, getValue, setValue, width)
+	width = width or 200
 	local dropdown
 	if MenuUtil and pcall(function() dropdown = CreateFrame("DropdownButton", name, parent, "WowStyle1DropdownTemplate") end) and dropdown then
-		dropdown:SetWidth(200)
+		dropdown:SetWidth(width)
 		dropdown:SetupMenu(function(owner, rootDescription)
 			for i = first, last do
 				rootDescription:CreateRadio(getText(i), function() return getValue() == i end, function() setValue(i) end)
@@ -189,7 +184,7 @@ local function CreateChoiceDropdown(name, parent, first, last, getText, getValue
 		dropdown.modern = true
 	else
 		dropdown = CreateFrame("Frame", name, parent, "UIDropDownMenuTemplate")
-		UIDropDownMenu_SetWidth(dropdown, 200)
+		UIDropDownMenu_SetWidth(dropdown, width)
 		UIDropDownMenu_Initialize(dropdown, function (frame, level, menuList)
 			local info = UIDropDownMenu_CreateInfo()
 			for i = first, last do
@@ -208,39 +203,67 @@ local function CreateChoiceDropdown(name, parent, first, last, getText, getValue
 	return dropdown
 end
 
+local function AnchorDropdown(dropdown, label)
+	if dropdown.modern then
+		dropdown:SetPoint("TOPLEFT", label, "BOTTOMLEFT", 0, -6)
+	else
+		dropdown:SetPoint("TOPLEFT", label, "BOTTOMLEFT", -20, -2)
+	end
+end
+
+local function RefreshPrices()
+	FarmLog:RefreshPrices()
+end
+
+-- where auction prices come from
+mfpanel.PriceAddon = mfpanel:CreateFontString(nil, 'ARTWORK', 'GameFontNormal')
+mfpanel.PriceAddon:SetPoint("TOPLEFT", mfpanel.PricesCategoryTitle, "BOTTOMLEFT", 0, -12)
+mfpanel.PriceAddon:SetWidth(300)
+mfpanel.PriceAddon:SetJustifyH("LEFT")
+mfpanel.PriceAddon:SetText(L["Price data from"])
+
+mfpanel.PriceAddonDropdown = CreateChoiceDropdown("FarmLogPriceAddonDropdown", mfpanel, 0, FARMLOG_PRICE_ADDON_COUNT - 1,
+	function(i) return L["price-addon-"..i] end,
+	function() return FLogGlobalVars.priceAddon or FARMLOG_PRICE_ADDON_AUTO end,
+	function(i)
+		FLogGlobalVars.priceAddon = i
+		RefreshPrices()
+	end, 260)
+AnchorDropdown(mfpanel.PriceAddonDropdown, mfpanel.PriceAddon)
+
+mfpanel.PriceAddonStatus = mfpanel:CreateFontString(nil, 'ARTWORK', 'GameFontHighlightSmall')
+mfpanel.PriceAddonStatus:SetPoint("LEFT", mfpanel.PriceAddonDropdown, "RIGHT", mfpanel.PriceAddonDropdown.modern and 10 or -5, 0)
+mfpanel.PriceAddonStatus:SetJustifyH("LEFT")
+
+mfpanel.AHMinQuality = mfpanel:CreateFontString(nil, 'ARTWORK', 'GameFontNormal')
+mfpanel.AHMinQuality:SetPoint("TOPLEFT", mfpanel.PriceAddon, "BOTTOMLEFT", 0, -40)
+mfpanel.AHMinQuality:SetWidth(300)
+mfpanel.AHMinQuality:SetJustifyH("LEFT")
+mfpanel.AHMinQuality:SetText(L["AH Min Quality"])
+
 mfpanel.AHMinQualityDropdown = CreateChoiceDropdown("FarmLogAHMinQualityDropdown", mfpanel, 0, 4,
 	function(i) return L["ah-quality-"..i] end,
 	function() return FLogGlobalVars.ahMinQuality end,
 	function(i)
 		FLogGlobalVars.ahMinQuality = i
-		FarmLog_MainWindow:RecalcTotals()
-		FarmLog_MainWindow:Refresh()
+		RefreshPrices()
 	end)
-if mfpanel.AHMinQualityDropdown.modern then
-	mfpanel.AHMinQualityDropdown:SetPoint("TOPLEFT", mfpanel.AHMinQuality, "BOTTOMLEFT", 0, -6)
-else
-	mfpanel.AHMinQualityDropdown:SetPoint("TOPLEFT", mfpanel.AHMinQuality, "BOTTOMLEFT", -20, -2)
-end
+AnchorDropdown(mfpanel.AHMinQualityDropdown, mfpanel.AHMinQuality)
 
 mfpanel.TSMPriceSource = mfpanel:CreateFontString(nil, 'ARTWORK', 'GameFontNormal')
 mfpanel.TSMPriceSource:SetPoint("TOPLEFT", mfpanel.AHMinQuality, "BOTTOMLEFT", 0, -40)
-mfpanel.TSMPriceSource:SetWidth(170)
+mfpanel.TSMPriceSource:SetWidth(300)
 mfpanel.TSMPriceSource:SetJustifyH("LEFT")
 mfpanel.TSMPriceSource:SetText(L["TSM Price Source"])
 
-mfpanel.TSMPriceSourceDropdown = CreateChoiceDropdown("FarmLogTSMPriceSourceDropdown", mfpanel, 0, 5,
-	function(i) return TSM_PRICE_SOURCES["tsm-price-source-"..i] end,
+mfpanel.TSMPriceSourceDropdown = CreateChoiceDropdown("FarmLogTSMPriceSourceDropdown", mfpanel, 0, TSM_PRICE_SOURCE_COUNT - 1,
+	function(i) return L["tsm-source-"..TSM_PRICE_SOURCES["tsm-price-source-"..i]] or TSM_PRICE_SOURCES["tsm-price-source-"..i] end,
 	function() return FLogGlobalVars.tsmPriceSource end,
 	function(i)
 		FLogGlobalVars.tsmPriceSource = i
-		FarmLog_MainWindow:RecalcTotals()
-		FarmLog_MainWindow:Refresh()
-	end)
-if mfpanel.TSMPriceSourceDropdown.modern then
-	mfpanel.TSMPriceSourceDropdown:SetPoint("TOPLEFT", mfpanel.TSMPriceSource, "BOTTOMLEFT", 0, -6)
-else
-	mfpanel.TSMPriceSourceDropdown:SetPoint("TOPLEFT", mfpanel.TSMPriceSource, "BOTTOMLEFT", -20, -2)
-end
+		RefreshPrices()
+	end, 260)
+AnchorDropdown(mfpanel.TSMPriceSourceDropdown, mfpanel.TSMPriceSource)
 
 
 ----------------------------------------------
@@ -379,6 +402,18 @@ mfpanel.ResetFontsButton:SetScript("OnClick", function(self) FarmLog_MainWindow:
 -- Init
 ----------------------------------------------
 
+function InterfacePanel:UpdatePriceAddonStatus()
+	local found = {}
+	if FarmLog:IsTSMLoaded() then tinsert(found, "TSM") end
+	if FarmLog:IsAuctionatorLoaded() then tinsert(found, "Auctionator") end
+	if #found > 0 then
+		InterfacePanel.MainFrame.PriceAddonStatus:SetText("|cff44ff44"..L["Found"]..": "..table.concat(found, ", ").."|r")
+	else
+		InterfacePanel.MainFrame.PriceAddonStatus:SetText("|cffff7744"..L["no-price-addon"].."|r")
+	end
+end
+InterfacePanel:HookScript("OnShow", function() InterfacePanel:UpdatePriceAddonStatus() end)
+
 function InterfacePanel:AddonLoaded()
 	InterfacePanel.MainFrame.AutoSwitchInstances:SetChecked(FLogGlobalVars.autoSwitchInstances)
 	InterfacePanel.MainFrame.ResumeSessionOnSwitch:SetChecked(FLogGlobalVars.resumeSessionOnSwitch)
@@ -405,6 +440,8 @@ function InterfacePanel:AddonLoaded()
 	InterfacePanel.MainFrame.TrackDeaths:SetChecked(FLogGlobalVars.track.deaths)
 	InterfacePanel.MainFrame.TrackResets:SetChecked(FLogGlobalVars.track.resets)
 
+	InterfacePanel.MainFrame.PriceAddonDropdown:RefreshText()
 	InterfacePanel.MainFrame.AHMinQualityDropdown:RefreshText()
 	InterfacePanel.MainFrame.TSMPriceSourceDropdown:RefreshText()
+	InterfacePanel:UpdatePriceAddonStatus()
 end 

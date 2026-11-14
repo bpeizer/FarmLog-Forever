@@ -146,6 +146,20 @@ function FarmLog_BuildLocalization(context)
     L["honorDRinBGs"] = "Enable honor diminishing returns in BGs"
     L["autoResumeBGs"] = "Auto resume BG farms when entering"
     L["TSM Price Source"] = "TSM Price Source"
+    L["Price data from"] = "Auction prices from"
+    L["price-addon-0"] = "Auto: TSM > Auctionator > scan"
+    L["price-addon-1"] = "TradeSkillMaster"
+    L["price-addon-2"] = "Auctionator"
+    L["price-addon-3"] = "FarmLog AH scan (/fl ah)"
+    L["Found"] = "Found"
+    L["no-price-addon"] = "No TSM / Auctionator found"
+    L["tsm-source-DBMarket"] = "DBMarket (realm market value)"
+    L["tsm-source-DBMinBuyout"] = "DBMinBuyout (lowest current buyout)"
+    L["tsm-source-DBHistorical"] = "DBHistorical (realm 60 day)"
+    L["tsm-source-DBRegionMarketAvg"] = "DBRegionMarketAvg (region market)"
+    L["tsm-source-DBRecent"] = "DBRecent (realm recent value)"
+    L["tsm-source-DBRegionHistorical"] = "DBRegionHistorical (region 60 day)"
+    L["tsm-source-DBRegionSaleAvg"] = "DBRegionSaleAvg (region sale price)"
     if (GetLocale() == "enUS") then
     end
     return L
