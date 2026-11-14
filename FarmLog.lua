@@ -76,9 +76,10 @@ end
 -- true if unit is a dead enemy we can loot; false if unknown/secret
 local function IsDeadEnemy(unit)
 	local ok, result = pcall(function()
-		local enemy, dead = UnitIsEnemy("player", unit), UnitIsDead(unit)
-		if issecret(enemy) or issecret(dead) then return false end
-		return enemy and dead
+		-- UnitIsEnemy is false for neutral (yellow) mobs, so also accept anything we can attack
+		local enemy, attackable, dead, isPlayer = UnitIsEnemy("player", unit), UnitCanAttack("player", unit), UnitIsDead(unit), UnitIsPlayer(unit)
+		if issecret(enemy) or issecret(attackable) or issecret(dead) or issecret(isPlayer) then return false end
+		return (enemy or attackable) and dead and not isPlayer
 	end)
 	return ok and result or false
 end
@@ -367,6 +368,8 @@ local lastShiftState = false
 local showingMinimapTip = false
 local sessionStartTime = nil 
 local lastMobLoot = {}
+local lastMobLootById = {} -- same as lastMobLoot, keyed by item ID (chat and loot window links can differ)
+local lootWindowHandled = false
 local lastUnknownLoot = {}
 local lastUnknownLootTime = 0
 local lastPlayerChecked = nil
@@ -1972,7 +1975,7 @@ function FarmLog:ParseXPEvent(chatmsg)
 	for _, st in ipairs(XPGainMobKillStrings) do
 		local mobName, amount = FLogDeformat(chatmsg, st)
 		if amount then
-			return amount
+			return amount, mobName
 		end
 	end
 	for _, st in ipairs(XPGainStrings) do
@@ -1984,14 +1987,18 @@ function FarmLog:ParseXPEvent(chatmsg)
 end
 
 function FarmLog:OnCombatXPEvent(text)
-	if not FLogGlobalVars.track.xp then return end 
-
-	local xp = self:ParseXPEvent(text)
-	if xp then 
+	local xp, mobName = self:ParseXPEvent(text)
+	if mobName then
+		-- "<mob> dies, you gain X experience" also tells us which mob was killed
+		self:OnXPKill(mobName)
+	end
+	if xp and FLogGlobalVars.track.xp then
 		IncreaseSessionVar("xp", xp)
+	end
+	if xp or mobName then
 		FarmLog_MainWindow:Refresh()
-	end 
-end 
+	end
+end
 
 -- Faction change 
 
@@ -2060,27 +2067,117 @@ end
 
 local guidNames = {}
 local guidNamesCount = 0
+local pendingUnknownKills = {} -- guid -> {kills=, drops=} session tables where an "Unknown" kill was counted
+
+-- move one kill from one name to another inside a session's kill/drop tables
+local function RenameKill(kills, drops, fromName, toName)
+	if not kills or not kills[fromName] or kills[fromName] <= 0 then return false end
+	kills[fromName] = kills[fromName] - 1
+	if kills[fromName] <= 0 then
+		if drops and drops[fromName] and next(drops[fromName]) then
+			kills[fromName] = 0 -- keep the row, it still has drops
+		else
+			kills[fromName] = nil
+			if drops then drops[fromName] = nil end
+		end
+	end
+	kills[toName] = (kills[toName] or 0) + 1
+	if drops and FLogGlobalVars.track.drops and not drops[toName] then drops[toName] = {} end
+	debug("|cff999999RenameKill|r |cffff9900"..fromName.."|r -> |cffff9900"..toName)
+	return true
+end
+
+local function RememberGUIDName(guid, name)
+	if not guid or not name or name == UNKNOWN_MOBNAME then return end
+	if not guidNames[guid] then
+		if guidNamesCount > 2000 then
+			guidNames = {}
+			guidNamesCount = 0
+		end
+		guidNamesCount = guidNamesCount + 1
+	end
+	guidNames[guid] = name
+	-- a kill of this mob was counted as Unknown earlier: give it its real name
+	local pending = pendingUnknownKills[guid]
+	if pending then
+		pendingUnknownKills[guid] = nil
+		if RenameKill(pending.kills, pending.drops, UNKNOWN_MOBNAME, name) and FarmLog_MainWindow:IsShown() then
+			FarmLog_MainWindow:Refresh()
+		end
+	end
+end
 
 function FarmLog:CacheUnitName(unit)
 	local guid = SafeUnitGUID(unit)
 	if not guid or guidNames[guid] then return end
-	local name = SafeUnitName(unit)
-	if not name then return end
-	if guidNamesCount > 1000 then
-		guidNames = {}
-		guidNamesCount = 0
+	RememberGUIDName(guid, SafeUnitName(unit))
+end
+
+-- NPC name from the client's creature cache, via a unit hyperlink tooltip
+local function NameFromTooltip(guid)
+	if not (C_TooltipInfo and C_TooltipInfo.GetHyperlink) then return end
+	if not (guid:find("^Creature%-") or guid:find("^Vehicle%-") or guid:find("^Pet%-")) then return end
+	local ok, data = pcall(C_TooltipInfo.GetHyperlink, "unit:"..guid)
+	if ok and type(data) == "table" and data.lines and data.lines[1] then
+		local name = Safe(data.lines[1].leftText)
+		if type(name) == "string" and #name > 0 then return name end
 	end
-	guidNames[guid] = name
-	guidNamesCount = guidNamesCount + 1
 end
 
 local function NameFromGUID(guid)
+	guid = Safe(guid)
+	if type(guid) ~= "string" then return nil end
 	if guidNames[guid] then return guidNames[guid] end
+	local name
 	if UnitTokenFromGUID then
 		local ok, unit = pcall(UnitTokenFromGUID, guid)
 		if ok and Safe(unit) then
-			return SafeUnitName(unit)
+			name = SafeUnitName(unit)
 		end
+	end
+	name = name or NameFromTooltip(guid)
+	if name then RememberGUIDName(guid, name) end
+	return name
+end
+
+-- Kills on modern clients come from two places: the PARTY_KILL event (has a GUID, name may be
+-- unknown) and the "<mob> dies, you gain X experience" message (has the name). They arrive within
+-- moments of each other, so match them up instead of counting the same kill twice.
+local KILL_MATCH_SECONDS = 3
+local recentKills = {}
+
+local function RegisterKill(mobName, guid, source)
+	local now = GetTime()
+	for i = #recentKills, 1, -1 do
+		if now - recentKills[i].time > KILL_MATCH_SECONDS then tremove(recentKills, i) end
+	end
+	local kills, drops = GetSessionVar("kills", false), GetSessionVar("drops", false)
+	for _, k in ipairs(recentKills) do
+		if not k.claimed and k.source ~= source and k.kills == kills then
+			if k.name == mobName then
+				-- same kill reported twice
+				k.claimed = true
+				RememberGUIDName(guid or k.guid, mobName)
+				return
+			elseif k.name == UNKNOWN_MOBNAME and mobName ~= UNKNOWN_MOBNAME then
+				-- the earlier report didn't know the name, now we do
+				k.claimed = true
+				if k.guid then pendingUnknownKills[k.guid] = nil end
+				RenameKill(kills, drops, UNKNOWN_MOBNAME, mobName)
+				RememberGUIDName(k.guid, mobName)
+				return
+			elseif mobName == UNKNOWN_MOBNAME and k.name ~= UNKNOWN_MOBNAME then
+				-- already counted with its name
+				k.claimed = true
+				RememberGUIDName(guid, k.name)
+				return
+			end
+		end
+	end
+	CountMobKill(mobName)
+	tinsert(recentKills, {name = mobName, guid = guid, time = now, source = source, kills = kills})
+	if guid and mobName == UNKNOWN_MOBNAME then
+		pendingUnknownKills[guid] = {kills = kills, drops = drops}
 	end
 end
 
@@ -2091,9 +2188,29 @@ function FarmLog:OnPartyKill(attackerGUID, targetGUID)
 	if targetGUID:find("^Player%-") then return end -- PvP kills are tracked by honor events
 
 	local mobName = NameFromGUID(targetGUID) or UNKNOWN_MOBNAME
-	CountMobKill(mobName)
-	debug("Party killed NPC "..mobName)
+	RegisterKill(mobName, targetGUID, "party")
+	debug("Party killed NPC "..mobName.." |cff999999"..targetGUID)
 	FarmLog_MainWindow:Refresh()
+end
+
+function FarmLog:OnXPKill(mobName)
+	if not COMBAT_LOG_RESTRICTED or not FLogGlobalVars.track.kills then return end
+	mobName = Safe(mobName)
+	if type(mobName) ~= "string" or #mobName == 0 then return end
+	RegisterKill(mobName, nil, "xp")
+	debug("XP kill "..mobName)
+end
+
+-- name of the corpse an item in loot slot i came from (modern clients)
+local function LootSlotSourceName(slot)
+	if not GetLootSourceInfo then return nil end
+	local ok, guid = pcall(GetLootSourceInfo, slot)
+	guid = ok and Safe(guid)
+	if type(guid) ~= "string" then return nil end
+	if not (guid:find("^Creature%-") or guid:find("^Vehicle%-") or guid:find("^Pet%-")) then return nil end
+	local name = NameFromGUID(guid)
+	if name then lastLootedMobs[guid] = time() end
+	return name, guid
 end
 
 -- Loot window event
@@ -2133,17 +2250,24 @@ function FarmLog:OnLootOpened(autoLoot)
 	end
 	
 	debug("|cff999999FarmLog:OnLootOpened|r mobName |cffff9900"..tostring(mobName))
+	local gathering = skillName ~= nil
 	lastMobLoot = {}
-	skillName = nil 
-	skillNameTime = nil 
-	for i = 1, lootCount do 
+	lastMobLootById = {}
+	skillName = nil
+	skillNameTime = nil
+	for i = 1, lootCount do
 		local link = Safe(GetLootSlotLink(i))
 		if link then
-			debug("|cff999999FarmLog:OnLootOpened|r link |cffff9900"..link)
-			lastMobLoot[link] = mobName
-		end 
-	end 
-end 
+			-- each slot can come from a different corpse (area loot, fast loot, looting a non-target)
+			local slotMobName = not gathering and LootSlotSourceName(i) or nil
+			local source = slotMobName or mobName
+			debug("|cff999999FarmLog:OnLootOpened|r link |cffff9900"..link.."|r source |cffff9900"..tostring(source))
+			lastMobLoot[link] = source
+			local itemId = extractItemID(link)
+			if itemId and source then lastMobLootById[itemId] = source end
+		end
+	end
+end
 
 
 -- Currency event
@@ -2406,9 +2530,14 @@ function FarmLog:InsertLoot(mobName, itemLink, count, vendorPrice, section, mul)
 	debug("|cff999999FarmLog:InsertLoot|r using |cffff9900"..priceType.."|r price of |cffff9900"..value.."|r mobName of |cffff9900"..mobName)
 
 	local sessionDrops = GetSessionVar(section, false)
-	if not sessionDrops[mobName] then		
+	if not sessionDrops[mobName] then
 		sessionDrops[mobName] = {}
-	end 
+	end
+	if section == "drops" then
+		-- the main window lists drops under their kill entry, make sure there is one
+		local sessionKills = GetSessionVar("kills", false)
+		sessionKills[mobName] = sessionKills[mobName] or 0
+	end
 	local meta = sessionDrops[mobName][itemLink]
 	if meta then
 		debug("|cff999999FarmLog:InsertLoot|r meta |cffff9900"..meta[1]..","..tostring(meta[2])..","..tostring(meta[3])..","..tostring(meta[4]))
@@ -2517,7 +2646,7 @@ function FarmLog:OnLootEvent(text, second, third)
 	if not FLogVars.enabled then return end 
 
 	local _, _, itemRarity, _, _, itemType, _, _, _, _, vendorPrice = GetItemInfo(itemLink);
-	mobName = lastMobLoot[itemLink]
+	mobName = lastMobLoot[itemLink] or (itemId and lastMobLootById[itemId])
 
 	if not mobName then 
 		-- loot window hasn't opened yet
@@ -2533,7 +2662,9 @@ function FarmLog:OnLootEvent(text, second, third)
 			if now - lastUnknownLootTime > LOOT_AUTOFIX_TIMEOUT_SEC then lastUnknownLoot = {} end 
 			lastUnknownLootTime = now 
 			lastUnknownLoot[itemLink] = true 
-			GetSessionVar("kills", false)[UNKNOWN_MOBNAME] = 1
+			-- make sure the Unknown row exists, without overwriting kills counted as Unknown
+			local sessionKills = GetSessionVar("kills", false)
+			sessionKills[UNKNOWN_MOBNAME] = sessionKills[UNKNOWN_MOBNAME] or 0
 		end 
 	end 
 
@@ -2964,15 +3095,32 @@ function FarmLog:OnEvent(event, ...)
 	-- on modern clients chat text can be a secret value (e.g. during encounters), skip those
 	if event:find("^CHAT_MSG_") and issecret((...)) then return end
 
+	-- learn mob names (modern clients only register these)
 	if event == "PLAYER_TARGET_CHANGED" then
 		self:CacheUnitName("target")
+		self:CacheUnitName("targettarget")
 		return
 	elseif event == "UPDATE_MOUSEOVER_UNIT" then
 		self:CacheUnitName("mouseover")
 		return
-	elseif event == "NAME_PLATE_UNIT_ADDED" then
+	elseif event == "PLAYER_SOFT_ENEMY_CHANGED" then
+		self:CacheUnitName("softenemy")
+		return
+	elseif event == "PLAYER_SOFT_INTERACT_CHANGED" then
+		self:CacheUnitName("softinteract")
+		return
+	elseif event == "PLAYER_FOCUS_CHANGED" then
+		self:CacheUnitName("focus")
+		return
+	elseif event == "NAME_PLATE_UNIT_ADDED" or event == "UNIT_TARGET" or event == "UNIT_THREAT_LIST_UPDATE" then
 		local unit = ...
-		if unit and not issecret(unit) then self:CacheUnitName(unit) end
+		if unit and not issecret(unit) then
+			if event == "UNIT_TARGET" then unit = unit.."target" end
+			self:CacheUnitName(unit)
+		end
+		return
+	elseif event == "LOOT_CLOSED" then
+		lootWindowHandled = false
 		return
 	end
 
@@ -2982,8 +3130,14 @@ function FarmLog:OnEvent(event, ...)
 		end
 
 		-- debug(event)
-		if event == "LOOT_OPENED" then
-			self:OnLootOpened(...)			
+		if event == "LOOT_READY" or event == "LOOT_OPENED" then
+			-- LOOT_READY comes first on modern clients (before fast auto loot empties the window),
+			-- handle whichever arrives first, once per loot window
+			-- (time check is a safety net in case LOOT_CLOSED is missed)
+			if not lootWindowHandled or GetTime() - lootWindowHandled > 5 then
+				lootWindowHandled = GetTime()
+				self:OnLootOpened(...)
+			end
 		elseif event == "CHAT_MSG_COMBAT_XP_GAIN" then 
 			self:OnCombatXPEvent(...);			
 		elseif event == "CHAT_MSG_SKILL" then 
@@ -3702,7 +3856,9 @@ do
 		"PLAYER_LEVEL_UP",
 		"ADDON_LOADED",
 		"CHAT_MSG_LOOT",
+		"LOOT_READY",
 		"LOOT_OPENED",
+		"LOOT_CLOSED",
 		"PLAYER_ENTERING_WORLD",
 		"CHAT_MSG_COMBAT_XP_GAIN",
 		"CHAT_MSG_COMBAT_HONOR_GAIN",
@@ -3722,9 +3878,15 @@ do
 	if COMBAT_LOG_RESTRICTED then
 		-- WoW Forever / modern client: combat log is not available to addons
 		tinsert(events, "PARTY_KILL")
+		-- events used to learn mob names, since PARTY_KILL only has GUIDs
 		tinsert(events, "PLAYER_TARGET_CHANGED")
 		tinsert(events, "UPDATE_MOUSEOVER_UNIT")
 		tinsert(events, "NAME_PLATE_UNIT_ADDED")
+		tinsert(events, "PLAYER_SOFT_ENEMY_CHANGED")
+		tinsert(events, "PLAYER_SOFT_INTERACT_CHANGED")
+		tinsert(events, "PLAYER_FOCUS_CHANGED")
+		tinsert(events, "UNIT_TARGET")
+		tinsert(events, "UNIT_THREAT_LIST_UPDATE")
 	else
 		tinsert(events, "COMBAT_LOG_EVENT_UNFILTERED")
 	end
